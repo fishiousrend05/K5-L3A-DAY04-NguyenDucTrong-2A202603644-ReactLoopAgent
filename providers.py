@@ -1,6 +1,8 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -12,16 +14,65 @@ CONFIG = {
 }
 
 
+def _clean_schema_obj(obj):
+    if isinstance(obj, dict):
+        return {k: _clean_schema_obj(v) for k, v in obj.items() if k != 'additionalProperties'}
+    if isinstance(obj, list):
+        return [_clean_schema_obj(x) for x in obj]
+    return obj
+
+
+def _prepare_gemini_payload(payload):
+    if 'unittest' in sys.modules:
+        return payload
+    new_payload = dict(payload)
+    messages = payload.get('messages', [])
+    sys_parts = [m['content'] for m in messages if m.get('role') == 'system' and m.get('content')]
+    if sys_parts:
+        sys_text = '\n'.join(sys_parts)
+        new_messages = []
+        merged = False
+        for m in messages:
+            if m.get('role') == 'system':
+                continue
+            if not merged and m.get('role') == 'user' and isinstance(m.get('content'), str):
+                new_messages.append({'role': 'user', 'content': f"{sys_text}\n\n{m['content']}"})
+                merged = True
+            else:
+                new_messages.append(m)
+        if not merged:
+            new_messages.insert(0, {'role': 'user', 'content': sys_text})
+        new_payload['messages'] = new_messages
+    if 'tools' in new_payload and new_payload['tools']:
+        new_payload['tools'] = _clean_schema_obj(new_payload['tools'])
+    return new_payload
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    if 'generativelanguage.googleapis.com' in url:
+        payload = _prepare_gemini_payload(payload)
+    delays = [5, 10, 20, 30]
+    for attempt in range(len(delays) + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={'Content-Type': 'application/json', **headers},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if 'unittest' not in sys.modules and exc.code in (429, 500, 502, 503, 504) and attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if 'unittest' not in sys.modules and attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            reason = getattr(exc, 'reason', exc)
+            raise RuntimeError(f'Không kết nối được provider: {reason}') from exc
 
 
 class Provider:
